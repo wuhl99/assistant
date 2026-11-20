@@ -742,17 +742,22 @@ function inlineMathToHtml(seg) {
   return out.replace(new RegExp(PH_L + '(\\d+)' + PH_R, 'g'), (m, n) => (bag[+n] || ''));
 }
 
-/* 公式比屏幕宽时整体等比缩小，保证一屏能看全，不撑出横向滚动 */
+/* 公式比屏幕宽时整体等比缩小（改字号，不动外边距，行间距不受影响） */
 function fitMath(root) {
   if (!root) return;
   const list = root.querySelectorAll ? root.querySelectorAll('.math-block') : [];
   list.forEach((el) => {
-    el.style.zoom = '';
+    el.style.fontSize = '';
     const avail = el.clientWidth;
     const need = el.scrollWidth;
     if (avail > 20 && need > avail + 2) {
-      const k = Math.max(0.5, avail / need);
-      el.style.zoom = (Math.round(k * 100) / 100).toFixed(2);
+      let k = Math.max(0.5, avail / need);
+      el.style.fontSize = Math.round(k * 100) + '%';
+      const need2 = el.scrollWidth;
+      if (need2 > avail + 2) {
+        k = Math.max(0.4, k * (avail / need2));
+        el.style.fontSize = Math.round(k * 100) + '%';
+      }
     }
   });
 }
@@ -1575,6 +1580,15 @@ async function runTurn(s) {
     let mdTail = null;   // 尾部未渲染的纯文本节点
     const scrollerEl = $('#scroller');
     const nearBottom = () => scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight < 140;
+    /* 跟随开关由你的手指决定：往上翻就停，滑回底部再恢复 */
+    let follow = true, selfScroll = false;
+    scrollerEl.addEventListener('scroll', () => {
+      if (selfScroll) return;
+      follow = nearBottom();
+    }, { passive: true });
+    scrollerEl.addEventListener('touchstart', () => {
+      follow = nearBottom();
+    }, { passive: true });
     const mathClosed = (str) => {
       // 状态机判断这段文字里的公式是否都已闭合（$$ 与 $ 分开算）
       let mode = 0; // 0=普通 1=行内$ 2=块级$$
@@ -1640,7 +1654,11 @@ async function runTurn(s) {
         shownA = acc.length;
       }
       /* 只有你本来就在底部时才跟着滚；往上翻看就不打扰 */
-      if (nearBottom()) scrollerEl.scrollTop = scrollerEl.scrollHeight;
+      if (follow && nearBottom()) {
+        selfScroll = true;
+        scrollerEl.scrollTop = scrollerEl.scrollHeight;
+        requestAnimationFrame(() => { selfScroll = false; });
+      }
     };
     const schedule = () => {
       if (rafPending) return;
@@ -1682,8 +1700,13 @@ async function runTurn(s) {
     if (usage) { bot.usage = normalizeUsage(usage); addLedger(bot.usage, s.id); }
     s.updated = Date.now();
     saveSessions();
-    renderMessages();
-    store.set('ds.scroll', JSON.stringify(Object.assign(S.scroll, { [s.id]: $('#scroller').scrollTop })));
+    const keepY = scrollerEl.scrollTop, wasFollow = follow;
+    renderMessages(false);            // 收尾重建时不要强行跳到底部
+    requestAnimationFrame(() => {
+      const sc = $('#scroller');
+      sc.scrollTop = wasFollow ? sc.scrollHeight : keepY;
+    });
+    store.set('ds.scroll', JSON.stringify(Object.assign(S.scroll, { [s.id]: keepY })));
   } catch (err) {
     bot.content = '出错了：' + err.message;
     bot.raw = false;
