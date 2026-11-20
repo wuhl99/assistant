@@ -62,7 +62,7 @@ svg{display:block}
 .md th,.md td{border:1px solid var(--line);padding:5px 8px;text-align:left}
 .md blockquote{border-left:3px solid var(--line);margin:8px 0;padding:0 10px;color:var(--dim)}
 .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
-.md .math-block{display:block;overflow-x:auto;overflow-y:hidden;margin:14px 0;padding:2px 0;max-width:100%}
+.md .math-block{display:block;overflow-x:auto;overflow-y:hidden;margin:10px 0;padding:2px 0;max-width:100%}
 .md .math-block .math-line{display:block;margin:0}
 .md .math-block .math-line+.math-line{margin-top:18px}
 .md .katex-display{margin:0}
@@ -1023,7 +1023,10 @@ function msgEl(m, idx) {
 
   const acts = document.createElement('div');
   acts.className = 'msg-actions';
-  acts.innerHTML = '<button data-act="copy">复制</button><button data-act="quote">追问</button><button data-act="regen">重写</button>';
+  const s0 = current();
+  const isLast = !!s0 && idx === s0.messages.length - 1;
+  acts.innerHTML = '<button data-act="copy">复制</button><button data-act="quote">追问</button>' +
+    (isLast ? '<button data-act="regen">重写</button>' : '');
   acts.addEventListener('click', (e) => {
     const act = e.target.closest('button')?.dataset.act;
     if (!act) return;
@@ -1809,6 +1812,7 @@ async function runTurn(s) {
 async function regenerate(idx) {
   const s = current();
   if (!s || S.streaming) return;
+  if (idx !== s.messages.length - 1) { toast('只能重写最后一条回答，否则后面的对话会被删掉'); return; }
   const m = s.messages[idx];
   if (!m || m.role !== 'assistant') return;
   s.messages = s.messages.slice(0, idx);
