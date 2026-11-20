@@ -153,6 +153,10 @@ svg{display:block}
 .ditem:active{background:var(--card)}
 .ditem.active{background:var(--blue-soft)}
 .dfoot{display:flex;align-items:center;gap:10px;padding:10px 8px 4px;border-top:1px solid var(--line);margin-top:6px}
+.dbackup{padding:6px 8px 0}
+.dbackup button{width:100%;border:0;background:transparent;color:#7a818c;font-size:12.5px;
+  padding:9px 8px;border-radius:10px;text-align:left;display:flex;align-items:center;gap:7px}
+.dbackup button:active{background:rgba(127,127,127,.14)}
 .avatar{width:30px;height:30px;border-radius:50%;background:var(--blue-soft);color:var(--blue);
   display:grid;place-items:center;font-size:14px;font-weight:600}
 
@@ -420,6 +424,13 @@ body.overlay-dark{background:#000}
     <input id="searchInput" placeholder="搜索对话内容...">
   </div>
   <div class="dlist" id="dlist"></div>
+  <div class="dbackup">
+    <button id="backupBtn">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+        <path d="M8 7l4-4 4 4M12 3v11M16 17l-4 4-4-4M12 21V10"/></svg>
+      备份与迁移
+    </button>
+  </div>
   <div class="dfoot">
     <div class="avatar">我</div>
     <div style="flex:1">本地账户</div>
@@ -1024,6 +1035,104 @@ function sessionSheet(s) {
 function hideSheet() {
   $('#sheet').classList.remove('show');
   if (!$('#drawer').classList.contains('show')) $('#backdrop').classList.remove('show');
+}
+
+/* ============ 备份与迁移：导出 / 导入 ============ */
+const BACKUP_KEYS = ['ds.sessions', 'ds.prompts', 'ds.think', 'ds.search', 'ds.effort'];
+function buildBackup() {
+  const data = {};
+  BACKUP_KEYS.forEach((k) => { const v = store.get(k); if (v !== null) data[k] = v; });
+  return { app: '圈题助手', v: 1, at: new Date().toISOString(), data };
+}
+function exportBackup() {
+  const txt = JSON.stringify(buildBackup());
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  const name = '圈题备份-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
+    '-' + p(d.getHours()) + p(d.getMinutes()) + '.json';
+  const blob = new Blob([txt], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 8000);
+  toast('已导出 ' + Math.max(1, Math.round(txt.length / 1024)) + ' KB，去下载目录找');
+}
+function applyBackup(txt) {
+  let obj = null;
+  try { obj = JSON.parse(txt); } catch (e) { }
+  if (!obj || typeof obj !== 'object' || !obj.data || typeof obj.data !== 'object') {
+    toast('这不是本应用的备份文件'); return;
+  }
+  const b = obj.data;
+  // 对话：按 id 合并，本地已有的保持不动
+  let curS = [];
+  try { curS = JSON.parse(store.get('ds.sessions') || '[]') || []; } catch (e) { curS = []; }
+  const have = {};
+  curS.forEach((s) => { if (s && s.id) have[s.id] = 1; });
+  let incS = [];
+  try { incS = JSON.parse(b['ds.sessions'] || '[]') || []; } catch (e) { incS = []; }
+  let addS = 0;
+  incS.forEach((s) => { if (s && s.id && !have[s.id]) { curS.unshift(s); have[s.id] = 1; addS++; } });
+  if (addS) { S.sessions = curS; saveSessions(); }
+  // 模板：按内容去重
+  let curP = [];
+  try { curP = JSON.parse(store.get('ds.prompts') || '[]') || []; } catch (e) { curP = []; }
+  let incP = [];
+  try { incP = JSON.parse(b['ds.prompts'] || '[]') || []; } catch (e) { incP = []; }
+  const texts = {};
+  curP.forEach((p) => { if (p && p.text) texts[p.text] = 1; });
+  let addP = 0;
+  incP.forEach((p) => {
+    if (p && p.text && !texts[p.text]) { curP.push(p); texts[p.text] = 1; addP++; }
+  });
+  if (addP) { S.prompts = curP; savePrompts(); }
+  // 开关类：本地没有才补上
+  ['ds.think', 'ds.search', 'ds.effort'].forEach((k) => {
+    if (b[k] != null && store.get(k) === null) store.set(k, b[k]);
+  });
+  toast('导入完成：对话 +' + addS + '，模板 +' + addP);
+  if (addS) setTimeout(() => location.reload(), 1000);
+}
+function importBackup() {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = 'application/json,.json';
+  inp.onchange = () => {
+    const f = inp.files && inp.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => applyBackup(String(r.result || ''));
+    r.onerror = () => toast('读不了这个文件');
+    r.readAsText(f);
+  };
+  inp.click();
+}
+function backupSheet() {
+  const sheet = $('#sheet');
+  sheet.innerHTML = '';
+  const title = document.createElement('div');
+  title.style.cssText = 'padding:10px 20px 6px;font-weight:600';
+  title.textContent = '备份与迁移';
+  sheet.appendChild(title);
+  const hint = document.createElement('div');
+  hint.style.cssText = 'padding:0 20px 10px;color:#8a9099;font-size:12.5px;line-height:1.6';
+  hint.textContent = '导出：把本网址的对话和模板存成一个文件。导入：把文件合并进来，已有的不覆盖。API Key 不进备份。';
+  sheet.appendChild(hint);
+  const mk = (label, fn) => {
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.onclick = () => { hideSheet(); fn(); };
+    sheet.appendChild(btn);
+  };
+  mk('导出备份', exportBackup);
+  mk('导入备份', importBackup);
+  const c = document.createElement('button');
+  c.className = 'cancel'; c.textContent = '取消';
+  c.onclick = hideSheet;
+  sheet.appendChild(c);
+  sheet.classList.add('show');
+  $('#backdrop').classList.add('show');
+  $('#backdrop').onclick = hideSheet;
 }
 
 /* ============ 输入区 ============ */
@@ -2215,6 +2324,7 @@ function promptSheet() {
   pushOverlay();
 }
 $('#promptBtn').onclick = promptSheet;
+$('#backupBtn').onclick = backupSheet;
 
 /* ============ 初始化 ============ */
 function init() {
