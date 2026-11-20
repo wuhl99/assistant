@@ -1038,7 +1038,7 @@ function hideSheet() {
 }
 
 /* ============ 备份与迁移：导出 / 导入 ============ */
-const BACKUP_KEYS = ['ds.sessions', 'ds.prompts', 'ds.think', 'ds.search', 'ds.effort'];
+const BACKUP_KEYS = ['ds.sessions', 'ds.prompts', 'ds.think', 'ds.search', 'ds.effort', 'ds.usage'];
 function buildBackup() {
   const data = {};
   BACKUP_KEYS.forEach((k) => { const v = store.get(k); if (v !== null) data[k] = v; });
@@ -1087,7 +1087,7 @@ function applyBackup(txt) {
   });
   if (addP) { S.prompts = curP; savePrompts(); }
   // 开关类：本地没有才补上
-  ['ds.think', 'ds.search', 'ds.effort'].forEach((k) => {
+  ['ds.think', 'ds.search', 'ds.effort', 'ds.usage'].forEach((k) => {
     if (b[k] != null && store.get(k) === null) store.set(k, b[k]);
   });
   toast('导入完成：对话 +' + addS + '，模板 +' + addP);
@@ -1339,6 +1339,60 @@ function lastUsage(s) {
   return null;
 }
 
+/* 总账：每次真实请求成功拿到 usage 就累加，重写/删消息/换对话都不减 */
+function loadLedger() {
+  try {
+    const o = JSON.parse(store.get('ds.usage') || 'null');
+    if (o && typeof o === 'object') {
+      return {
+        hit: o.hit || 0, miss: o.miss || 0, out: o.out || 0, in: o.in || 0,
+        n: o.n || 0, rounds: o.rounds || [], since: o.since || Date.now(),
+      };
+    }
+  } catch (e) { }
+  return { hit: 0, miss: 0, out: 0, in: 0, n: 0, rounds: [], since: Date.now() };
+}
+function addLedger(u, sid) {
+  const L0 = loadLedger();
+  L0.hit += u.hit; L0.miss += u.miss; L0.out += u.out; L0.in += u.in; L0.n++;
+  L0.rounds.push({ t: Date.now(), s: sid || '', in: u.in, hit: u.hit, out: u.out });
+  if (L0.rounds.length > 300) L0.rounds = L0.rounds.slice(-300);
+  store.set('ds.usage', JSON.stringify(L0));
+  return L0;
+}
+
+/* 上下文长度估算：中文字约 1 token，英文约 4 字符 1 token；图片每张按 1024 计 */
+function estTokens(m) {
+  if (!m) return 0;
+  let body = '';
+  if (Array.isArray(m.content)) {
+    m.content.forEach((c) => {
+      if (c.type === 'image_url') return;
+      if (c.text) body += c.text;
+    });
+  } else body = m.content || '';
+  let n = 0;
+  for (let i = 0; i < body.length; i++) {
+    const c = body.charCodeAt(i);
+    n += c > 127 ? 1.7 : 0.25;      // 中文/全角约 1 token，英文 4 字符约 1
+  }
+  if (m.quote) n += m.quote.length * 0.5;
+  return Math.round(n);
+}
+function estimateNext(s) {
+  const sys = ((s && s.system) || '').trim();
+  let sysTok = Math.round((sys.length * 0.9) + (MATH_STYLE.length * 0.3));
+  let hist = 0, imgs = 0;
+  ((s && s.messages) || []).forEach((m) => {
+    hist += estTokens(m) + 4;
+    imgs += ((m && m.images) || []).length;
+  });
+  let newTok = estTokens({ content: input.value || '' }) + 4;
+  imgs += S.pendingImages.length;
+  const total = sysTok + hist + newTok + imgs * 1024 + 32;
+  return { total, sys: sysTok, hist, imgs, new: newTok };
+}
+
 /* ============ 发送 ============ */
 async function send() {
   if (S.streaming) return;
@@ -1566,7 +1620,7 @@ async function runTurn(s) {
     bot.content = acc;
     bot.reasoning = reasoning;
     bot.raw = false;
-    if (usage) bot.usage = normalizeUsage(usage);
+    if (usage) { bot.usage = normalizeUsage(usage); addLedger(bot.usage, s.id); }
     s.updated = Date.now();
     saveSessions();
     renderMessages();
@@ -1628,23 +1682,45 @@ $('#reqBtn').onclick = () => {
   const cur = current();
   const u = lastUsage(cur);
   const tot = sessionUsage(cur);
+  const led = loadLedger();
+  const est = estimateNext(cur);
   const usageLines = u ? [
     '输入 ' + fmtK(u.in) + '（命中 ' + fmtK(u.hit) + ' · 未命中 ' + fmtK(u.miss) + '）',
     '输出 ' + fmtK(u.out),
     '这一轮约 ' + fmtMoney(costOf(u, false)) + '（空闲价）· ' + fmtMoney(costOf(u, true)) + '（高峰价）',
   ] : ['还没拿到用量（接口没返回 usage，或这轮没走完）'];
   const totLines = tot.n ? [
-    '已统计 ' + tot.n + ' 轮',
+    '本对话已计 ' + tot.n + ' 轮（按当前历史里还留着的回答算）',
     '输入 ' + fmtK(tot.in) + '（命中 ' + fmtK(tot.hit) + ' · 未命中 ' + fmtK(tot.miss) + '）',
     '输出 ' + fmtK(tot.out),
-    '合计约 ' + fmtMoney(costOf(tot, false)) + '（空闲价）· ' + fmtMoney(costOf(tot, true)) + '（高峰价）',
+    '约 ' + fmtMoney(costOf(tot, false)) + '（空闲价）· ' + fmtMoney(costOf(tot, true)) + '（高峰价）',
   ] : ['这个对话还没有用量'];
+  const estLines = [
+    '约 ' + fmtK(est.total) + ' tokens',
+    '设定 ' + fmtK(est.sys) + ' · 历史 ' + fmtK(est.hist) +
+      (est.imgs ? ' · 图片 ' + est.imgs + ' 张（约 ' + fmtK(est.imgs * 1024) + '）' : '') +
+      (est.new > 5 ? ' · 这次要发的 ' + fmtK(est.new) : ''),
+    '全未缓存时约 ' + fmtMoney(costOf({ hit: 0, miss: est.total, out: 0 }, false)) +
+      '，全命中约 ' + fmtMoney(costOf({ hit: est.total, miss: 0, out: 0 }, false)),
+    '（估算，误差 5%~15%）',
+  ];
+  const ledLines = led.n ? [
+    '开账以来共 ' + led.n + ' 轮，累计输入 ' + fmtK(led.in) + ' · 输出 ' + fmtK(led.out),
+    '累计约 ' + fmtMoney(costOf(led, false)) + '（空闲价）· ' + fmtMoney(costOf(led, true)) + '（高峰价）',
+    '重写、删对话都不减，只增不减',
+  ] : ['还没有记录'];
   const diag = [
+    '—— 预计下次请求 ——',
+    ...estLines,
+    '',
     '—— 上一次用量 ——',
     ...usageLines,
     '',
     '—— 本对话累计 ——',
     ...totLines,
+    '',
+    '—— 总账（所有对话） ——',
+    ...ledLines,
     '',
     '—— 本次参数 ——',
     '深度思考：' + (rb ? (rb.thinking && rb.thinking.type === 'enabled' ? '开' : '关') : '-'),
