@@ -62,7 +62,9 @@ svg{display:block}
 .md th,.md td{border:1px solid var(--line);padding:5px 8px;text-align:left}
 .md blockquote{border-left:3px solid var(--line);margin:8px 0;padding:0 10px;color:var(--dim)}
 .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
-.md .math-block{display:block;overflow-x:auto;overflow-y:hidden;margin:10px 0;padding:2px 0;max-width:100%}
+.md .math-block{display:block;overflow-x:auto;overflow-y:hidden;margin:14px 0;padding:2px 0;max-width:100%}
+.md .math-block .math-line{display:block;margin:0}
+.md .math-block .math-line+.math-line{margin-top:8px}
 .md .katex-display{margin:0}
 .md .katex{font-size:1.05em}
 .md .katex-display>.katex{white-space:normal}
@@ -717,8 +719,12 @@ function inlineMathToHtml(seg) {
   /* 独立成行的 $$...$$（_ 归一化后可能出现）先提走，避免被当成行内 */
   const blocks = [];
   const pre = normalized.replace(/\n?\$\$([\s\S]+?)\$\$\n?/g, (m, t) => {
-    const html = texToHtml(t.trim(), true);
-    blocks.push(html != null ? html : ('<span class="math-error">' + esc(t.trim()) + '</span>'));
+    const tex = t.trim();
+    const html = texToHtml(tex, true);
+    blocks.push({
+      tex,
+      html: html != null ? html : ('<span class="math-error">' + esc(tex) + '</span>'),
+    });
     return PH_L + 'B' + (blocks.length - 1) + PH_R;
   });
 
@@ -738,26 +744,121 @@ function inlineMathToHtml(seg) {
     out = marked.parse(guarded);
   }
   out = out.replace(new RegExp(PH_L + 'B(\\d+)' + PH_R, 'g'),
-    (m, n) => '<div class="math-block">' + (blocks[+n] || '') + '</div>');
+    (m, n) => {
+      const b = blocks[+n] || {};
+      return '<div class="math-block" data-tex="' + escAttr(b.tex || '') + '">' + (b.html || '') + '</div>';
+    });
   return out.replace(new RegExp(PH_L + '(\\d+)' + PH_R, 'g'), (m, n) => (bag[+n] || ''));
 }
 
-/* 公式比屏幕宽时整体等比缩小（改字号，不动外边距，行间距不受影响） */
+function escAttr(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/* 在顶层运算符处把一条长公式切成几段（花括号、括号、\left \right 内部不切） */
+function splitTopLevel(tex, ops) {
+  const cuts = [];
+  let depth = 0;
+  for (let i = 0; i < tex.length; i++) {
+    const c = tex[i];
+    if (c === '\\') {
+      const m = /^\\([a-zA-Z]+)/.exec(tex.slice(i));
+      if (m) {
+        const name = m[1];
+        if (name === 'left') depth++;
+        else if (name === 'right') depth = Math.max(0, depth - 1);
+        else if (depth === 0 && ops.indexOf('\\' + name) >= 0) cuts.push(i);
+        i += m[0].length - 1;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (c === '{' || c === '(' || c === '[') { depth++; continue; }
+    if (c === '}' || c === ')' || c === ']') { depth = Math.max(0, depth - 1); continue; }
+    if (depth === 0 && ops.indexOf(c) >= 0 && i > 0) {
+      const prev = tex[i - 1];
+      if ((c === '-' || c === '+') && /[=+\-*/(,{]/.test(prev)) continue;  // 一元正负号不切
+      cuts.push(i);
+    }
+  }
+  const segs = [];
+  let start = 0;
+  cuts.forEach((p) => {
+    const s = tex.slice(start, p);
+    if (s.trim()) segs.push(s);
+    start = p;
+  });
+  const last = tex.slice(start);
+  if (last.trim()) segs.push(last);
+  return segs;
+}
+
+/* 量一条公式在给定上下文里的宽度 */
+function measureTex(host, tex) {
+  const d = document.createElement('span');
+  d.style.cssText = 'position:absolute;visibility:hidden;white-space:nowrap;left:-9999px;top:0';
+  host.appendChild(d);
+  let w = Infinity;
+  try { katex.render(tex, d, { displayMode: true, throwOnError: true }); w = d.getBoundingClientRect().width; } catch (e) { }
+  d.remove();
+  return w;
+}
+
+/* 把长公式按运算符切成多行，每行尽量放满一行宽 */
+function wrapTex(tex, host, avail) {
+  if (typeof katex === 'undefined') return null;
+  const plans = [['='], ['=', '+', '-', '\\cdot', '\\times', '\\qquad']];
+  for (const ops of plans) {
+    const segs = splitTopLevel(tex, ops);
+    if (segs.length < 2) continue;
+    const lines = [];
+    let cur = '';
+    for (const s of segs) {
+      const cand = cur + s;
+      if (cur && measureTex(host, cand) > avail) { lines.push(cur.trim()); cur = s; }
+      else cur = cand;
+    }
+    if (cur.trim()) lines.push(cur.trim());
+    if (lines.length > 1) return lines;
+  }
+  return null;
+}
+
+/* 公式比屏幕宽：先在运算符处换行，还放不下才轻微缩小（不低于 75%，避免看不清） */
 function fitMath(root) {
   if (!root) return;
   const list = root.querySelectorAll ? root.querySelectorAll('.math-block') : [];
   list.forEach((el) => {
+    if (!el.classList.contains('math-block')) return;
     el.style.fontSize = '';
     const avail = el.clientWidth;
-    const need = el.scrollWidth;
-    if (avail > 20 && need > avail + 2) {
-      let k = Math.max(0.5, avail / need);
-      el.style.fontSize = Math.round(k * 100) + '%';
-      const need2 = el.scrollWidth;
-      if (need2 > avail + 2) {
-        k = Math.max(0.4, k * (avail / need2));
-        el.style.fontSize = Math.round(k * 100) + '%';
+    if (!(avail > 40)) return;
+    if (el.scrollWidth <= avail + 2) return;
+
+    /* ① 换行 */
+    const tex = el.getAttribute('data-tex');
+    if (tex && !el.dataset.wrapped) {
+      el.dataset.wrapped = '1';
+      let lines = null;
+      try { lines = wrapTex(tex, el.parentNode || el, avail); } catch (e) { lines = null; }
+      if (lines && lines.length > 1) {
+        el.textContent = '';
+        lines.forEach((ln) => {
+          const d = document.createElement('div');
+          d.className = 'math-line';
+          try { katex.render(ln, d, { displayMode: true, throwOnError: true }); }
+          catch (e) { d.textContent = ln; }
+          el.appendChild(d);
+        });
       }
+    }
+
+    /* ② 换行后单行仍超宽，才缩小一点 */
+    const need = el.scrollWidth;
+    if (need > avail + 2) {
+      const k = Math.max(0.75, avail / need);
+      el.style.fontSize = Math.round(k * 100) + '%';
     }
   });
 }
@@ -771,7 +872,8 @@ function renderMarkdown(text) {
     if (i % 2 === 1) {
       const tex = parts[i].trim();
       const html = texToHtml(tex, true);
-      out += '<div class="math-block">' + (html != null ? html : '<span class="math-error">' + esc(tex) + '</span>') + '</div>';
+      out += '<div class="math-block" data-tex="' + escAttr(tex) + '">' +
+        (html != null ? html : '<span class="math-error">' + esc(tex) + '</span>') + '</div>';
     } else if (parts[i]) {
       out += inlineMathToHtml(parts[i]);
     }
@@ -1580,15 +1682,15 @@ async function runTurn(s) {
     let mdTail = null;   // 尾部未渲染的纯文本节点
     const scrollerEl = $('#scroller');
     const nearBottom = () => scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight < 140;
-    /* 跟随开关由你的手指决定：往上翻就停，滑回底部再恢复 */
+    /* 跟随开关由你的手指决定：一碰屏幕就暂停跟随，松手后再看是否回到底部 */
     let follow = true, selfScroll = false;
     scrollerEl.addEventListener('scroll', () => {
       if (selfScroll) return;
       follow = nearBottom();
     }, { passive: true });
-    scrollerEl.addEventListener('touchstart', () => {
-      follow = nearBottom();
-    }, { passive: true });
+    scrollerEl.addEventListener('touchstart', () => { follow = false; }, { passive: true });
+    scrollerEl.addEventListener('touchend', () => { follow = nearBottom(); }, { passive: true });
+    scrollerEl.addEventListener('touchcancel', () => { follow = nearBottom(); }, { passive: true });
     const mathClosed = (str) => {
       // 状态机判断这段文字里的公式是否都已闭合（$$ 与 $ 分开算）
       let mode = 0; // 0=普通 1=行内$ 2=块级$$
