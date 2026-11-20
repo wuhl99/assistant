@@ -1300,6 +1300,45 @@ function setQuote(text) {
 }
 $('#quoteClear').onclick = () => { S.pendingQuote = null; $('#quoteChip').style.display = 'none'; };
 
+/* ============ 用量与费用 ============ */
+/* DeepSeek 官方价：元 / 百万 tokens，空闲时段（高峰时段翻倍：0.04 / 2 / 8） */
+const PRICE = { hit: 0.02, miss: 1, out: 4 };
+function normalizeUsage(u) {
+  const hit = u.prompt_cache_hit_tokens ||
+    (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0;
+  const miss = u.prompt_cache_miss_tokens != null
+    ? u.prompt_cache_miss_tokens
+    : Math.max(0, (u.prompt_tokens || 0) - hit);
+  const out = u.completion_tokens || 0;
+  return { hit, miss, out, in: u.prompt_tokens || (hit + miss) };
+}
+function costOf(u, peak) {
+  const k = peak ? 2 : 1;
+  return (u.hit * PRICE.hit + u.miss * PRICE.miss + u.out * PRICE.out) / 1e6 * k;
+}
+function fmtMoney(v) {
+  if (v >= 1) return v.toFixed(2) + ' 元';
+  if (v >= 0.01) return (v * 100).toFixed(1) + ' 分';
+  return (v * 1000).toFixed(2) + ' 厘';
+}
+function fmtK(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(2) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'K';
+  return String(n);
+}
+function sessionUsage(s) {
+  const t = { hit: 0, miss: 0, out: 0, in: 0, n: 0 };
+  ((s && s.messages) || []).forEach((m) => {
+    if (m.usage) { t.hit += m.usage.hit; t.miss += m.usage.miss; t.out += m.usage.out; t.in += m.usage.in; t.n++; }
+  });
+  return t;
+}
+function lastUsage(s) {
+  const ms = (s && s.messages) || [];
+  for (let i = ms.length - 1; i >= 0; i--) if (ms[i].usage) return ms[i].usage;
+  return null;
+}
+
 /* ============ 发送 ============ */
 async function send() {
   if (S.streaming) return;
@@ -1401,6 +1440,7 @@ async function runTurn(s) {
     model: MODEL,
     messages,
     stream: true,
+    stream_options: { include_usage: true },
     thinking: { type: S.think ? 'enabled' : 'disabled' },
   };
   if (S.think) body.reasoning_effort = curEffort();
@@ -1415,11 +1455,22 @@ async function runTurn(s) {
   S.streaming = true;
   $('#sendBtn').disabled = true;
   try {
-    const resp = await fetch(API, {
+    const doFetch = () => fetch(API, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + S.key },
       body: JSON.stringify(body),
     });
+    let resp = await doFetch();
+    if (!resp.ok && resp.status === 400) {
+      const t0 = await resp.text();
+      // 万一接口不认 stream_options，去掉重发一次，别因为拿不到用量就发不出去
+      if (/stream_options/i.test(t0)) {
+        delete body.stream_options;
+        resp = await doFetch();
+      } else {
+        throw new Error('HTTP 400：' + t0.slice(0, 300));
+      }
+    }
     if (!resp.ok) {
       const t = await resp.text();
       throw new Error('HTTP ' + resp.status + '：' + t.slice(0, 300));
@@ -1429,6 +1480,7 @@ async function runTurn(s) {
     let buf = '';
     let acc = '';
     let reasoning = '';
+    let usage = null;   // 最后一个 chunk 里带的总用量
 
     /* 流式刷新节流：每帧最多重绘一次；正文按「新增部分」追加，不整段重建 */
     let rafPending = false;
@@ -1494,6 +1546,7 @@ async function runTurn(s) {
         if (payload === '[DONE]') continue;
         try {
           const j = JSON.parse(payload);
+          if (j.usage) usage = j.usage;
           const d = j.choices?.[0]?.delta || {};
           if (d.reasoning_content) {
             if (!reasoning) thinkBox.style.display = 'block';
@@ -1513,6 +1566,7 @@ async function runTurn(s) {
     bot.content = acc;
     bot.reasoning = reasoning;
     bot.raw = false;
+    if (usage) bot.usage = normalizeUsage(usage);
     s.updated = Date.now();
     saveSessions();
     renderMessages();
@@ -1571,7 +1625,27 @@ $('#reqBtn').onclick = () => {
   const lr = window.__lastReq;
   const rb = lr && lr.body ? lr.body : null;
   const effName = { low: '低', high: '高', max: '最高' };
+  const cur = current();
+  const u = lastUsage(cur);
+  const tot = sessionUsage(cur);
+  const usageLines = u ? [
+    '输入 ' + fmtK(u.in) + '（命中 ' + fmtK(u.hit) + ' · 未命中 ' + fmtK(u.miss) + '）',
+    '输出 ' + fmtK(u.out),
+    '这一轮约 ' + fmtMoney(costOf(u, false)) + '（空闲价）· ' + fmtMoney(costOf(u, true)) + '（高峰价）',
+  ] : ['还没拿到用量（接口没返回 usage，或这轮没走完）'];
+  const totLines = tot.n ? [
+    '已统计 ' + tot.n + ' 轮',
+    '输入 ' + fmtK(tot.in) + '（命中 ' + fmtK(tot.hit) + ' · 未命中 ' + fmtK(tot.miss) + '）',
+    '输出 ' + fmtK(tot.out),
+    '合计约 ' + fmtMoney(costOf(tot, false)) + '（空闲价）· ' + fmtMoney(costOf(tot, true)) + '（高峰价）',
+  ] : ['这个对话还没有用量'];
   const diag = [
+    '—— 上一次用量 ——',
+    ...usageLines,
+    '',
+    '—— 本对话累计 ——',
+    ...totLines,
+    '',
     '—— 本次参数 ——',
     '深度思考：' + (rb ? (rb.thinking && rb.thinking.type === 'enabled' ? '开' : '关') : '-'),
     '思考等级：' + (rb && rb.reasoning_effort
