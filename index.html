@@ -64,7 +64,7 @@ svg{display:block}
 .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
 .md .math-block{display:block;overflow-x:auto;overflow-y:hidden;margin:14px 0;padding:2px 0;max-width:100%}
 .md .math-block .math-line{display:block;margin:0}
-.md .math-block .math-line+.math-line{margin-top:8px}
+.md .math-block .math-line+.math-line{margin-top:18px}
 .md .katex-display{margin:0}
 .md .katex{font-size:1.05em}
 .md .katex-display>.katex{white-space:normal}
@@ -1680,17 +1680,10 @@ async function runTurn(s) {
     let domDone = 0;     // 正文已渲染进 DOM 的位置
     let thinkText = null;
     let mdTail = null;   // 尾部未渲染的纯文本节点
+    /* 输出过程中：只要你碰过屏幕，本轮就不再自动滚动（一碰就停，最简单也最可靠） */
     const scrollerEl = $('#scroller');
-    const nearBottom = () => scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight < 140;
-    /* 跟随开关由你的手指决定：一碰屏幕就暂停跟随，松手后再看是否回到底部 */
-    let follow = true, selfScroll = false;
-    scrollerEl.addEventListener('scroll', () => {
-      if (selfScroll) return;
-      follow = nearBottom();
-    }, { passive: true });
-    scrollerEl.addEventListener('touchstart', () => { follow = false; }, { passive: true });
-    scrollerEl.addEventListener('touchend', () => { follow = nearBottom(); }, { passive: true });
-    scrollerEl.addEventListener('touchcancel', () => { follow = nearBottom(); }, { passive: true });
+    let touched = false;
+    scrollerEl.addEventListener('touchstart', () => { touched = true; }, { passive: true });
     const mathClosed = (str) => {
       // 状态机判断这段文字里的公式是否都已闭合（$$ 与 $ 分开算）
       let mode = 0; // 0=普通 1=行内$ 2=块级$$
@@ -1755,12 +1748,8 @@ async function runTurn(s) {
         mdTail.textContent = acc.slice(domDone);
         shownA = acc.length;
       }
-      /* 只有你本来就在底部时才跟着滚；往上翻看就不打扰 */
-      if (follow && nearBottom()) {
-        selfScroll = true;
-        scrollerEl.scrollTop = scrollerEl.scrollHeight;
-        requestAnimationFrame(() => { selfScroll = false; });
-      }
+      /* 没碰过屏幕就跟到底；碰过就完全不动，让你安心看 */
+      if (!touched) scrollerEl.scrollTop = scrollerEl.scrollHeight;
     };
     const schedule = () => {
       if (rafPending) return;
@@ -1802,12 +1791,9 @@ async function runTurn(s) {
     if (usage) { bot.usage = normalizeUsage(usage); addLedger(bot.usage, s.id); }
     s.updated = Date.now();
     saveSessions();
-    const keepY = scrollerEl.scrollTop, wasFollow = follow;
+    const keepY = scrollerEl.scrollTop;
     renderMessages(false);            // 收尾重建时不要强行跳到底部
-    requestAnimationFrame(() => {
-      const sc = $('#scroller');
-      sc.scrollTop = wasFollow ? sc.scrollHeight : keepY;
-    });
+    requestAnimationFrame(() => { $('#scroller').scrollTop = keepY; });
     store.set('ds.scroll', JSON.stringify(Object.assign(S.scroll, { [s.id]: keepY })));
   } catch (err) {
     bot.content = '出错了：' + err.message;
