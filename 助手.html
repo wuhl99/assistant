@@ -808,10 +808,8 @@ function measureTex(host, tex) {
 /* 把长公式按运算符切成多行，每行尽量放满一行宽 */
 function wrapTex(tex, host, avail) {
   if (typeof katex === 'undefined') return null;
-  const plans = [['='], ['=', '+', '-', '\\cdot', '\\times', '\\qquad']];
-  for (const ops of plans) {
-    const segs = splitTopLevel(tex, ops);
-    if (segs.length < 2) continue;
+  /* 第一优先：只在等号处断 */
+  const packSegs = (segs) => {
     const lines = [];
     let cur = '';
     for (const s of segs) {
@@ -820,9 +818,18 @@ function wrapTex(tex, host, avail) {
       else cur = cand;
     }
     if (cur.trim()) lines.push(cur.trim());
-    if (lines.length > 1) return lines;
+    return lines;
+  };
+  let lines = packSegs(splitTopLevel(tex, ['=']));
+  /* 等号断完还有某一行放不下，才在这一行里退到加减号 */
+  const fixed = [];
+  for (const l of lines) {
+    if (measureTex(host, l) <= avail) { fixed.push(l); continue; }
+    const sub = splitTopLevel(l, ['+', '-', '\\cdot', '\\times']);
+    if (sub.length > 1) fixed.push(...packSegs(sub));
+    else fixed.push(l);
   }
-  return null;
+  return fixed.length > 1 ? fixed : null;
 }
 
 /* 公式比屏幕宽：先在运算符处换行，还放不下才轻微缩小（不低于 75%，避免看不清） */
@@ -2331,7 +2338,21 @@ $('#ppSend').onclick = () => {
 
 
 /* ============ 双击选中整段（不弹自己的按钮） ============ */
-const BLOCK_SEL = '.md p, .md li, .md h1, .md h2, .md h3, .md blockquote, .md td';
+const BLOCK_SEL = '.md p, .md li, .md h1, .md h2, .md h3, .md blockquote, .md td, .md .math-block';
+/* 选中的文字；如果选的是公式块，直接取它的 LaTeX 源码，避免复制出乱码 */
+function selText() {
+  const sel = window.getSelection();
+  const b = window.__lastSelBlock;
+  if ((!sel || sel.isCollapsed) && b && b.getAttribute && b.getAttribute('data-tex'))
+    return '$$' + b.getAttribute('data-tex') + '$$';
+  if (!sel) return '';
+  const node = sel.anchorNode;
+  const el = node && (node.nodeType === 1 ? node : node.parentElement);
+  const mb = el && el.closest && el.closest('.math-block');
+  const tex = mb && mb.getAttribute('data-tex');
+  if (tex) return '$$' + tex + '$$';
+  return (sel.toString() || '').trim();
+}
 function selectContents(el) {
   if (!el) return;
   const range = document.createRange();
@@ -2352,12 +2373,19 @@ function selectContents(el) {
 /* 选中后自动弹出的复制条 */
 const copyBar = document.getElementById('copyBar');
 function showCopyBar() {
+  let r = null;
   const sel = window.getSelection();
-  if (!sel || sel.isCollapsed || !sel.rangeCount) { hideCopyBar(); return; }
-  const node = sel.anchorNode;
-  const el = node && (node.nodeType === 1 ? node : node.parentElement);
-  if (!el || !el.closest('.md')) { hideCopyBar(); return; }
-  const r = sel.getRangeAt(0).getBoundingClientRect();
+  if (sel && !sel.isCollapsed && sel.rangeCount) {
+    const node = sel.anchorNode;
+    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+    if (el && el.closest('.md')) r = sel.getRangeAt(0).getBoundingClientRect();
+  }
+  /* 公式的选区在部分浏览器里会塌掉，这时用记录下来的公式块兜底 */
+  if (!r) {
+    const b = window.__lastSelBlock;
+    if (!b || !b.getAttribute || !b.getAttribute('data-tex')) { hideCopyBar(); return; }
+    r = b.getBoundingClientRect();
+  }
   if (!r || (!r.width && !r.height)) { hideCopyBar(); return; }
   copyBar.classList.add('show');
   // 贴着选区：默认在上方，放不下就放下方，左右不出屏
@@ -2380,13 +2408,12 @@ copyBar.addEventListener('pointerdown', (e) => e.preventDefault());
 copyBar.addEventListener('click', (e) => {
   const act = e.target.closest('button') && e.target.closest('button').dataset.act;
   if (act === 'copy') {
-    const sel = window.getSelection();
-    const text = sel ? sel.toString() : '';
+    const text = selText();
     if (!text) { toast('没有选中内容'); return; }
     navigator.clipboard.writeText(text).then(() => toast('已复制'), () => toast('复制失败'));
   } else if (act === 'quote') {
     const sel = window.getSelection();
-    const text = sel ? sel.toString().trim() : '';
+    const text = selText();
     if (text) setQuote(text);
     if (sel) sel.removeAllRanges();
     hideCopyBar();
@@ -2402,7 +2429,7 @@ copyBar.addEventListener('click', (e) => {
 
 document.addEventListener('dblclick', (e) => {
   const block = e.target.closest(BLOCK_SEL);
-  if (block) { e.preventDefault(); selectContents(block); showCopyBar(); }
+  if (block) { e.preventDefault(); window.__lastSelBlock = block; selectContents(block); showCopyBar(); }
 });
 let __lastTap = 0, __lastBlock = null;
 document.addEventListener('touchend', (e) => {
@@ -2411,6 +2438,7 @@ document.addEventListener('touchend', (e) => {
   if (!block) { __lastTap = 0; __lastBlock = null; return; }
   if (block === __lastBlock && now - __lastTap < 380) {
     e.preventDefault();
+    window.__lastSelBlock = block;
     selectContents(block);
     showCopyBar();
     __lastTap = 0; __lastBlock = null;
