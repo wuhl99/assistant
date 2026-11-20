@@ -1,4 +1,4 @@
-const CACHE = 'dsq-v12';
+const CACHE = 'dsq-v13';
 /* 逐个缓存，任何一个 404 都不影响安装 */
 const SHELL = ['./', './index.html', './助手.html', './icon-192.png', './icon-512.png', './manifest.webmanifest'];
 
