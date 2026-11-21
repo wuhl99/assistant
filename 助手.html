@@ -197,6 +197,18 @@ svg{display:block}
   touch-action:none;background:#111}
 .pp-stage canvas{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:none;max-height:none}
 #ppInk{pointer-events:none}
+#ppCropBox{position:absolute;display:none;box-sizing:border-box;border:1.5px solid #fff;
+  box-shadow:0 0 0 9999px rgba(0,0,0,.5);pointer-events:none;z-index:2;border-radius:2px}
+#ppCropBox.on{display:block}
+#photoPage.cropmode .pp-stage{cursor:crosshair}
+#ppMode{display:flex;align-items:center;gap:6px;border:0;background:#232838;color:#fff;
+  border-radius:999px;padding:7px 12px;font:inherit;font-size:13px;flex:0 0 auto}
+#ppMode svg{width:15px;height:15px}
+#ppClose{margin-right:auto}
+.pp-hint{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:3;
+  background:rgba(20,22,28,.9);color:#fff;font-size:13px;padding:8px 14px;border-radius:999px;
+  pointer-events:none;opacity:0;transition:opacity .2s;white-space:nowrap;max-width:88%;overflow:hidden}
+.pp-hint.on{opacity:1}
 .pp-bottom{flex:0 0 auto;background:#111;padding:6px 10px calc(8px + var(--safe-b))}
 .pp-sugs{display:flex;gap:8px;overflow-x:auto;padding:2px 0 8px;scrollbar-width:none}
 .pp-sugs::-webkit-scrollbar{display:none}
@@ -370,10 +382,15 @@ body.overlay-dark{background:#000}
     <button class="icobtn" id="ppReset" aria-label="清除圈选">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
         <path d="M7 4v8a5 5 0 0 0 10 0V4"/><path d="M4 20h16"/></svg></button>
+    <button id="ppMode" aria-label="切换圈画和裁剪">
+      <svg id="ppModeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></svg>
+      <span id="ppModeText">裁剪</span></button>
   </div>
   <div class="pp-stage" id="ppStage">
     <canvas id="ppCanvas"></canvas>
     <canvas id="ppInk"></canvas>
+    <div id="ppCropBox"></div>
+    <div class="pp-hint" id="ppHint"></div>
   </div>
   <div class="pp-bottom">
     <div class="pp-sugs" id="ppSugs">
@@ -2074,21 +2091,26 @@ $('#camFlip').onclick = async () => {
 };
 
 /* ============ 拍照圈选页 ============ */
-const P = { img: null, strokes: [], redo: [], drawing: false, pts: [], scale: 1, wipe: false };
+const P = { img: null, box: { x: 0, y: 0, w: 1, h: 1 }, strokes: [], hist: [], future: [],
+  drawing: false, pts: [], mode: 'draw', cropStart: null, cropRect: null };
 const ppStage = $('#ppStage'), ppCanvas = $('#ppCanvas'), ppInk = $('#ppInk');
 const ppCtx = ppCanvas.getContext('2d'), ppIctx = ppInk.getContext('2d');
 
-function fitPhoto() {
+/* box 是原图上的取景框；裁剪只改 box，画质不掉（始终从原图重绘） */
+function fitPhoto(force) {
   if (!P.img) return;
   const stage = ppStage.getBoundingClientRect();
   if (!stage.width || !stage.height) return;
-  const k = Math.min(1, 1600 / Math.max(P.img.width, P.img.height));
-  if (ppCanvas.width !== Math.round(P.img.width * k)) {
-    ppCanvas.width = Math.round(P.img.width * k);
-    ppCanvas.height = Math.round(P.img.height * k);
-    ppInk.width = ppCanvas.width;
-    ppInk.height = ppCanvas.height;
-    ppCtx.drawImage(P.img, 0, 0, ppCanvas.width, ppCanvas.height);
+  const b = P.box;
+  const k = Math.min(1, 1600 / Math.max(b.w, b.h));
+  const cw = Math.max(1, Math.round(b.w * k));
+  const ch = Math.max(1, Math.round(b.h * k));
+  if (force || ppCanvas.width !== cw || ppCanvas.height !== ch) {
+    ppCanvas.width = cw;
+    ppCanvas.height = ch;
+    ppInk.width = cw;
+    ppInk.height = ch;
+    ppCtx.drawImage(P.img, b.x, b.y, b.w, b.h, 0, 0, cw, ch);
     paintStrokes();
   }
   /* 宽度优先撑满；只有高度放不下时才整体缩小，保证不变形也不浪费横向空间 */
@@ -2106,22 +2128,18 @@ function openPhoto(src) {
   pushOverlay();
   const im = new Image();
   im.onload = () => {
-    P.img = im; P.strokes = []; P.redo = []; P.pts = [];
-    const k = Math.min(1, 1600 / Math.max(im.width, im.height));
-    ppCanvas.width = Math.round(im.width * k);
-    ppCanvas.height = Math.round(im.height * k);
-    ppInk.width = ppCanvas.width;
-    ppInk.height = ppCanvas.height;
-    ppCtx.drawImage(im, 0, 0, ppCanvas.width, ppCanvas.height);
-    clearInkLayer();
+    P.img = im;
+    P.box = { x: 0, y: 0, w: im.width, h: im.height };
+    P.strokes = []; P.hist = []; P.future = []; P.pts = [];
+    P.drawing = false; P.cropStart = null; P.cropRect = null;
     document.body.classList.add('overlay-dark');
     ppInput.value = '';
     syncPpChips();
     refreshPpSendIcon();
     $('#ppPlusPanel').classList.remove('show');
     resetPpAddIcon();
+    fitPhoto(true);
     updateUndoRedo();
-    fitPhoto();
     // 底部栏高度变化后再校正两帧，保证第一张也铺满
     requestAnimationFrame(fitPhoto);
     setTimeout(fitPhoto, 60);
@@ -2163,8 +2181,23 @@ function paintStrokes() {
 }
 
 function updateUndoRedo() {
-  $('#ppUndo').disabled = P.strokes.length === 0;
-  $('#ppRedo').disabled = P.redo.length === 0;
+  $('#ppUndo').disabled = P.hist.length === 0;
+  $('#ppRedo').disabled = P.future.length === 0;
+}
+
+function ppState() {
+  return { box: { ...P.box }, strokes: P.strokes.map((s) => s.map((p) => ({ x: p.x, y: p.y }))) };
+}
+function ppPushHist() {
+  P.hist.push(ppState());
+  if (P.hist.length > 30) P.hist.shift();
+  P.future = [];
+}
+function ppRestore(st) {
+  P.box = { ...st.box };
+  P.strokes = st.strokes.map((s) => s.map((p) => ({ x: p.x, y: p.y })));
+  fitPhoto(true);
+  updateUndoRedo();
 }
 
 function ppPos(ev) {
@@ -2174,15 +2207,98 @@ function ppPos(ev) {
   return { x: (p.clientX - r.left) * k, y: (p.clientY - r.top) * k };
 }
 
+/* ---- 裁剪 ---- */
+function ppShowCrop(r) {
+  const cr = ppCanvas.getBoundingClientRect();
+  const sr = ppStage.getBoundingClientRect();
+  const k = cr.width / ppCanvas.width;
+  const el = $('#ppCropBox');
+  el.classList.add('on');
+  el.style.left = (cr.left - sr.left + r.x * k) + 'px';
+  el.style.top = (cr.top - sr.top + r.y * k) + 'px';
+  el.style.width = (r.w * k) + 'px';
+  el.style.height = (r.h * k) + 'px';
+}
+function ppHideCrop() { $('#ppCropBox').classList.remove('on'); }
+
+function ppCropRect(a, b) {
+  const x = Math.max(0, Math.min(a.x, b.x));
+  const y = Math.max(0, Math.min(a.y, b.y));
+  const x2 = Math.min(ppCanvas.width, Math.max(a.x, b.x));
+  const y2 = Math.min(ppCanvas.height, Math.max(a.y, b.y));
+  return { x: x, y: y, w: Math.max(0, x2 - x), h: Math.max(0, y2 - y) };
+}
+
+/* 松手即裁：只改取景框，回到原图重绘，画质不损 */
+function ppApplyCrop(r) {
+  ppHideCrop();
+  const minPx = Math.max(26, ppCanvas.width * 0.06);
+  if (r.w < minPx || r.h < minPx) return;
+  if (!P.img) return;
+  const f = P.box.w / ppCanvas.width;
+  const x = P.box.x + r.x * f;
+  const y = P.box.y + r.y * f;
+  const w = Math.min(r.w * f, P.img.width - x);
+  const h = Math.min(r.h * f, P.img.height - y);
+  ppPushHist();
+  P.box = { x: x, y: y, w: w, h: h };
+  P.strokes = []; P.pts = []; P.drawing = false;
+  fitPhoto(true);
+  updateUndoRedo();
+  ppHint('已裁剪');
+}
+
+let ppHintTimer = 0;
+function ppHint(txt) {
+  const h = $('#ppHint');
+  h.textContent = txt;
+  h.classList.add('on');
+  clearTimeout(ppHintTimer);
+  ppHintTimer = setTimeout(() => h.classList.remove('on'), 1500);
+}
+
+const PP_ICON = {
+  crop: '<path d="M7 3v14h14"/><path d="M3 7h14v14"/>',
+  pen: '<path d="M4 20l1-4.2L16.4 4.4a2 2 0 0 1 2.8 2.8L7.8 18.6 4 20z"/>'
+};
+function ppSetMode(m) {
+  P.mode = m;
+  $('#photoPage').classList.toggle('cropmode', m === 'crop');
+  $('#ppModeText').textContent = m === 'crop' ? '圈画' : '裁剪';
+  $('#ppModeIcon').innerHTML = m === 'crop' ? PP_ICON.pen : PP_ICON.crop;
+  if (m !== 'crop') ppHideCrop();
+  store.set('ds.ppmode', m);
+}
+$('#ppMode').onclick = () => {
+  const m = P.mode === 'crop' ? 'draw' : 'crop';
+  ppSetMode(m);
+  if (m === 'crop') ppHint('按住拖出要保留的方框，松手就裁好');
+};
+ppSetMode(store.get('ds.ppmode') === 'crop' ? 'crop' : 'draw');
+
 ppStage.addEventListener('pointerdown', (e) => {
   if (!P.img) return;
-  P.drawing = true; P.pts = [];
   const p = ppPos(e);
+  if (P.mode === 'crop') {
+    P.cropStart = p;
+    P.cropRect = { x: p.x, y: p.y, w: 0, h: 0 };
+    ppShowCrop(P.cropRect);
+    ppStage.setPointerCapture(e.pointerId);
+    e.preventDefault();
+    return;
+  }
+  P.drawing = true; P.pts = [];
   P.pts.push(p);
   ppStage.setPointerCapture(e.pointerId);
   e.preventDefault();
 });
 ppStage.addEventListener('pointermove', (e) => {
+  if (P.mode === 'crop' && P.cropStart) {
+    P.cropRect = ppCropRect(P.cropStart, ppPos(e));
+    ppShowCrop(P.cropRect);
+    e.preventDefault();
+    return;
+  }
   if (!P.drawing) return;
   const p = ppPos(e);
   const last = P.pts[P.pts.length - 1];
@@ -2195,17 +2311,29 @@ ppStage.addEventListener('pointermove', (e) => {
   e.preventDefault();
 });
 ppStage.addEventListener('pointerup', (e) => {
+  if (P.mode === 'crop' && P.cropStart) {
+    const r = ppCropRect(P.cropStart, ppPos(e));
+    P.cropStart = null; P.cropRect = null;
+    ppApplyCrop(r);
+    e.preventDefault();
+    return;
+  }
   if (!P.drawing) return;
   P.drawing = false;
   P.pts.push(ppPos(e));
   if (P.pts.length > 6) {
+    ppPushHist();
     P.strokes.push(P.pts.slice());
-    P.redo = [];
   }
   P.pts = [];
   paintStrokes();
   updateUndoRedo();
   e.preventDefault();
+});
+/* 拖动被系统打断（来电、切后台）时别留下半截框 */
+ppStage.addEventListener('pointercancel', () => {
+  if (P.cropStart) { P.cropStart = null; P.cropRect = null; ppHideCrop(); }
+  if (P.drawing) { P.drawing = false; P.pts = []; paintStrokes(); }
 });
 
 function drawOne(st, dashed) {
@@ -2218,16 +2346,21 @@ function drawOne(st, dashed) {
 }
 
 $('#ppUndo').onclick = () => {
-  if (!P.strokes.length) return;
-  P.redo.push(P.strokes.pop());
-  paintStrokes(); updateUndoRedo();
+  if (!P.hist.length) return;
+  P.future.push(ppState());
+  ppRestore(P.hist.pop());
 };
 $('#ppRedo').onclick = () => {
-  if (!P.redo.length) return;
-  P.strokes.push(P.redo.pop());
+  if (!P.future.length) return;
+  P.hist.push(ppState());
+  ppRestore(P.future.pop());
+};
+$('#ppReset').onclick = () => {
+  if (!P.strokes.length) return;
+  ppPushHist();
+  P.strokes = [];
   paintStrokes(); updateUndoRedo();
 };
-$('#ppReset').onclick = () => { P.strokes = []; P.redo = []; paintStrokes(); updateUndoRedo(); };
 $('#ppClose').onclick = () => { closePhotoPage(); popOverlaySilently(); };
 
 function buildCrop() {
